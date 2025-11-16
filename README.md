@@ -1,15 +1,15 @@
-# @elysiajs/static
+# @wiajs/static
 Plugin for [elysia](https://github.com/saltyaom/elysia) for serving static folder.
 
 ## Installation
 ```bash
-bun add @elysiajs/static
+bun add @wiajs/static
 ```
 
 ## Example
 ```typescript
 import { Elysia } from 'elysia'
-import { staticPlugin } from '@elysiajs/static'
+import { staticPlugin } from '@wiajs/static'
 
 const app = new Elysia()
     .use(staticPlugin())
