@@ -1,3 +1,25 @@
+# 1.4.8 - 17 Nov 2025
+
+Bug fix:
+
+- production 下 assets: 'public' 找不到
+  已统一为绝对路径并校验存在性，且动态分支使用 assetsDir/多 root；✅ 已解决。
+
+- production 新增或更新文件
+  默认动态通配符：✅ 立即生效（ETag/304 保证高效）。
+  预注册模式：需要重启（或你扩展成 fs.watch/mtime 刷新缓存）。
+
+- 新增目录
+  默认动态通配符：✅ 立即生效（目录→/→index.html 回退）。
+  预注册：需重启或监听。
+
+# 1.4.7 - 17 Nov 2025
+
+Bug fix:
+
+- 生产模式下 路径错误
+- 生产模式下 没有自动添加 index.html
+
 # 1.4.6 - 3 Nov 2025
 Bug fix:
 - normalize path only when unsafe

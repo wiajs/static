@@ -6,6 +6,34 @@ Plugin for [elysia](https://github.com/saltyaom/elysia) for serving static folde
 bun add @wiajs/static
 ```
 
+## 使用说明
+
+默认（推荐）：动态通配符，生产环境也支持增/改/新目录的即时生效：
+
+```js
+app.use(staticPlugin({
+  assets: ['public', 'assets'], // 支持数组
+  prefix: '/',                  // 根路径服务
+  preCompressed: true,          // 若你的构建产出 .br/.gz
+  redirect: true,               // 目录无斜杠时 301 补齐
+  headers: { 'X-Powered-By': 'elysia-static' }
+}))
+```
+
+预注册（小目录、高性能）：
+
+```js
+app.use(staticPlugin({
+  assets: 'public',
+  prefix: '/',
+  alwaysStatic: true,           // 预注册
+  staticLimit: 2000,            // 若超限会自动回退为动态
+  extension: true,
+  indexHTML: true
+}))
+```
+
+
 ## Example
 ```typescript
 import { Elysia } from 'elysia'

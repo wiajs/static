@@ -1,265 +1,421 @@
 import {Elysia, NotFoundError} from 'elysia'
 import fastDecodeURI from 'fast-decode-uri-component'
 import type {StaticOptions} from './types'
-import {
-  fileExists,
-  generateETag,
-  getBuiltinModule,
-  getFile,
-  isBun,
-  isCached,
-  isNotEmpty,
-  listFiles,
-  listHTMLFiles,
-  LRUCache,
-} from './utils'
+import {fileExists, generateETag, getBuiltinModule, getFile, isBun, isCached, listFiles} from './utils'
 
-export async function staticPlugin<const Prefix extends string = '/prefix'>({
-  assets = 'public',
-  prefix = '/public' as Prefix,
-  staticLimit = 1024,
-  alwaysStatic = process.env.NODE_ENV === 'production',
-  ignorePatterns = ['.DS_Store', '.git', '.env'],
-  headers: initialHeaders,
-  maxAge = 86400,
-  directive = 'public',
-  etag: useETag = true,
-  extension = true,
-  indexHTML = true,
-  decodeURI,
-  silent,
-}: StaticOptions<Prefix> = {}): Promise<Elysia> {
-  if (typeof process === 'undefined' || typeof process.getBuiltinModule === 'undefined') {
-    if (!silent) console.warn('[@elysiajs/static] require process.getBuiltinModule. Static plugin is disabled')
+// -------- types --------
+type Encoding = 'br' | 'gzip' | undefined
+interface CacheEntry {
+  body: any // BunFile | Buffer
+  etag?: string
+  mtimeMs?: number // dev 模式用于热更新校验
+  size: number
+  hits: number
+  lastAccess: number
+  prewarmed: boolean
+}
 
+// -------- defaults --------
+const DEFAULTS = {
+  prefix: '/' as const,
+  indexHTML: true,
+  indexFiles: ['index.html'],
+  etag: true,
+  maxAge: 86400,
+  directive: 'public',
+  redirect: true,
+  preCompressed: false,
+  enableHEAD: true,
+  ignorePatterns: ['.DS_Store', '.git', '.env'],
+  prewarmEnable: process.env.NODE_ENV === 'production',
+  prewarmMaxFiles: 300,
+  cacheMaxEntries: process.env.NODE_ENV === 'production' ? 1000 : 400,
+  cacheOvershoot: 200,
+}
+
+// -------- helpers --------
+function normalizePrefix(p: string) {
+  if (!p.startsWith('/')) p = '/' + p
+  if (!p.endsWith('/')) p = p + '/'
+  return p
+}
+
+function negotiateEncoding(ae: string | null | undefined): Encoding {
+  if (!ae) return undefined
+  const s = ae.toLowerCase()
+  if (s.includes('br')) return 'br'
+  if (s.includes('gzip')) return 'gzip'
+  return undefined
+}
+
+function guessContentType(p: string) {
+  const ext = p.split('?')[0].split('#')[0].split('.').pop()?.toLowerCase()
+  switch (ext) {
+    case 'html':
+      return 'text/html; charset=utf-8'
+    case 'css':
+      return 'text/css; charset=utf-8'
+    case 'js':
+    case 'mjs':
+      return 'application/javascript; charset=utf-8'
+    case 'json':
+      return 'application/json; charset=utf-8'
+    case 'svg':
+      return 'image/svg+xml'
+    case 'png':
+      return 'image/png'
+    case 'jpg':
+    case 'jpeg':
+      return 'image/jpeg'
+    case 'webp':
+      return 'image/webp'
+    case 'ico':
+      return 'image/x-icon'
+    case 'woff':
+      return 'font/woff'
+    case 'woff2':
+      return 'font/woff2'
+    default:
+      return undefined
+  }
+}
+
+function assetsToRoots(assets: string | string[]) {
+  const list = Array.isArray(assets) ? assets : [assets]
+  const [, path] = getBuiltinModule()!
+  return list.map(p => (path.isAbsolute(p) ? p : path.resolve(p)))
+}
+
+function requirePath(root: string, rel: string) {
+  const [, path] = getBuiltinModule()!
+  // relUrlPath 使用 posix 分隔，统一替换为系统分隔
+  const clean = rel.replace(/^\//, '')
+  return path.join(root, clean)
+}
+
+async function statSafe(fs: any, p: string) {
+  try {
+    return await fs.stat(p)
+  } catch {
+    return null
+  }
+}
+
+function shouldIgnoreFactory(ignore: (string | RegExp)[]) {
+  if (!ignore?.length) return () => false
+  return (file: string) => ignore.find(pat => (typeof pat === 'string' ? file.includes(pat) : pat.test(file)))
+}
+
+function headersToObject(h: Headers) {
+  const o: Record<string, string> = {}
+  h.forEach((v, k) => (o[k.toLowerCase()] = v))
+  return o
+}
+
+function cacheKey(p: string, enc?: Encoding) {
+  return enc ? `${p}::${enc}` : p
+}
+
+// -------- main plugin --------
+export async function staticPlugin<const Prefix extends string = '/'>(
+  opts: StaticOptions<Prefix> = {}
+): Promise<Elysia> {
+  const {
+    prefix = DEFAULTS.prefix as any,
+    assets = 'public',
+    ignorePatterns = DEFAULTS.ignorePatterns,
+    headers: initialHeaders,
+    maxAge = DEFAULTS.maxAge,
+    directive = DEFAULTS.directive,
+    etag: useETag = DEFAULTS.etag,
+    indexHTML = DEFAULTS.indexHTML,
+    indexFiles = DEFAULTS.indexFiles,
+    redirect = DEFAULTS.redirect,
+    decodeURI,
+    preCompressed = DEFAULTS.preCompressed,
+    enableHEAD = DEFAULTS.enableHEAD,
+    silent,
+    // cache/prewarm
+    prewarmEnable = DEFAULTS.prewarmEnable,
+    prewarmMaxFiles = DEFAULTS.prewarmMaxFiles,
+    cacheMaxEntries = DEFAULTS.cacheMaxEntries,
+    cacheOvershoot = DEFAULTS.cacheOvershoot,
+  } = opts
+
+  if (typeof process === 'undefined' || typeof (process as any).getBuiltinModule === 'undefined') {
+    if (!silent) console.warn('[@elysiajs/static] require process.getBuiltinModule. Disabled.')
     return new Elysia()
   }
 
-  const builtinModule = getBuiltinModule()
-  if (!builtinModule) return new Elysia()
+  const builtin = getBuiltinModule()
+  if (!builtin) return new Elysia()
+  const [fs] = builtin
 
-  const [fs, path] = builtinModule
-  const isUnsafeSep = path.sep !== '/'
+  const roots = assetsToRoots(assets)
+  const _prefix = normalizePrefix(String(prefix))
+  const ignore = shouldIgnoreFactory(ignorePatterns)
+  const devMode = !prewarmEnable
 
-  const normalizePath = isUnsafeSep ? (p: string) => p.replace(/\\/g, '/') : (p: string) => p
+  const app = new Elysia({name: 'static', seed: _prefix})
 
-  const fileCache = new LRUCache<string, Response>()
+  // ---- cache container ----
+  const cache = new Map<string, CacheEntry>() // key: fullPath(.br/.gz 可带编码后缀)
 
-  if (prefix === path.sep) prefix = '' as Prefix
-  const assetsDir = path.resolve(assets)
-  const shouldIgnore = !ignorePatterns.length
-    ? () => false
-    : (file: string) =>
-        ignorePatterns.find(pattern => (typeof pattern === 'string' ? file.includes(pattern) : pattern.test(file)))
-
-  const app = new Elysia({
-    name: 'static',
-    seed: prefix,
-  })
-
-  if (alwaysStatic) {
-    const files = await listFiles(path.resolve(assets))
-
-    if (files.length <= staticLimit) {
-      for (const absolutePath of files) {
-        if (!absolutePath || shouldIgnore(absolutePath)) continue
-
-        let relativePath = absolutePath.replace(assetsDir, '')
-        if (decodeURI) relativePath = fastDecodeURI(relativePath) ?? relativePath
-
-        let pathName = normalizePath(path.join(prefix, relativePath))
-
-        if (isBun && absolutePath.endsWith('.html')) {
-          const htmlBundle = await import(absolutePath)
-
-          app.get(pathName, htmlBundle.default)
-          if (indexHTML && pathName.endsWith('/index.html')) {
-            const rootPath = pathName.replace('/index.html', '') || '/'
-            app.get(rootPath, htmlBundle.default)
-          }
-
-          continue
-        }
-
-        if (!extension) pathName = normalizePath(pathName.slice(0, pathName.lastIndexOf('.')))
-
-        const file: Awaited<ReturnType<typeof getFile>> = isBun
-          ? getFile(absolutePath)
-          : ((await getFile(absolutePath)) as any)
-
-        if (!file) {
-          if (!silent) console.warn(`[@elysiajs/static] Failed to load file: ${absolutePath}`)
-
-          return new Elysia()
-        }
-
-        const etag = await generateETag(file)
-
-        function handleCache({headers: requestHeaders}: {headers: Record<string, string>}) {
-          if (etag) {
-            const cached = isCached(requestHeaders as any, etag, absolutePath)
-
-            if (cached === true)
-              return new Response(null, {
-                status: 304,
-                headers: isNotEmpty(initialHeaders) ? initialHeaders : undefined,
-              })
-            else if (cached !== false) {
-              const cache = fileCache.get(pathName)
-              if (cache) return cache.clone()
-
-              return cached.then(cached => {
-                if (cached)
-                  return new Response(null, {
-                    status: 304,
-                    headers: initialHeaders ? initialHeaders : undefined,
-                  })
-
-                const response = new Response(file, {
-                  headers: Object.assign(
-                    {
-                      'Cache-Control': maxAge ? `${directive}, max-age=${maxAge}` : directive,
-                    },
-                    initialHeaders,
-                    etag ? {Etag: etag} : {}
-                  ),
-                })
-                fileCache.set(pathName, response)
-
-                return response.clone()
-              })
-            }
-          }
-
-          const cache = fileCache.get(pathName)
-          if (cache) return cache.clone()
-
-          const response = new Response(file, {
-            headers: Object.assign(
-              {
-                'Cache-Control': maxAge ? `${directive}, max-age=${maxAge}` : directive,
-              },
-              initialHeaders,
-              etag ? {Etag: etag} : {}
-            ),
-          })
-
-          fileCache.set(pathName, response)
-
-          return response.clone()
-        }
-        app.get(
-          pathName,
-          useETag
-            ? (handleCache as any)
-            : new Response(
-                file,
-                isNotEmpty(initialHeaders)
-                  ? {
-                      headers: initialHeaders,
-                    }
-                  : undefined
-              )
-        )
-
-        if (indexHTML && pathName.endsWith('/index.html'))
-          app.get(
-            pathName.replace('/index.html', '') || '/',
-            useETag
-              ? (handleCache as any)
-              : new Response(file, isNotEmpty(initialHeaders) ? {headers: initialHeaders} : undefined)
-          )
-      }
-
-      return app
-    }
+  function touch(entry: CacheEntry) {
+    entry.hits += 1
+    entry.lastAccess = Date.now()
   }
 
-  if (
-    // @ts-expect-error private property
-    !(`GET_${prefix}/*` in app.routeTree)
-  ) {
-    if (isBun) {
-      const htmls = await listHTMLFiles(path.resolve(assets))
+  function putCache(key: string, entry: CacheEntry) {
+    cache.set(key, entry)
+    maybeCleanup()
+  }
 
-      for (const absolutePath of htmls) {
-        if (!absolutePath || shouldIgnore(absolutePath)) continue
+  function maybeCleanup() {
+    const limit = cacheMaxEntries
+    const overshoot = cacheOvershoot
+    if (cache.size <= limit + overshoot) return
 
-        const relativePath = absolutePath.replace(assetsDir, '')
-        const pathName = normalizePath(path.join(prefix, relativePath))
-        const htmlBundle = await import(absolutePath)
+    const arr = Array.from(cache.entries())
+    // hits 升序 + lastAccess 升序（命中少且最久未访问优先被清）
+    arr.sort((a, b) => {
+      const ea = a[1],
+        eb = b[1]
+      if (ea.hits !== eb.hits) return ea.hits - eb.hits
+      return ea.lastAccess - eb.lastAccess
+    })
+    const toRemove = arr.length - limit
+    for (let i = 0; i < toRemove; i++) cache.delete(arr[i][0])
+  }
 
-        app.get(pathName, htmlBundle.default)
-        if (indexHTML && pathName.endsWith('/index.html')) {
-          const rootPath = pathName.replace('/index.html', '') || '/'
-          app.get(rootPath, htmlBundle.default)
-        }
+  // ---- production prewarm（仅预热前 N 个文件；不热更）----
+  if (prewarmEnable) {
+    let loaded = 0
+    for (const root of roots) {
+      const files = await listFiles(root).catch(() => [])
+      for (const fileAbs of files) {
+        if (loaded >= prewarmMaxFiles) break
+        if (!fileAbs || ignore(fileAbs)) continue
+        // 不对目录做预热，这里 files 已经是平铺文件集合
+        const body = isBun ? getFile(fileAbs) : await getFile(fileAbs)
+        const st = await statSafe(fs, fileAbs)
+        const et = useETag ? await generateETag(body as any) : undefined
+        putCache(cacheKey(fileAbs), {
+          body,
+          etag: et,
+          mtimeMs: st?.mtimeMs,
+          size: st?.size ?? 0,
+          hits: 0,
+          lastAccess: Date.now(),
+          prewarmed: true,
+        })
+        loaded++
       }
+      if (loaded >= prewarmMaxFiles) break
     }
+    if (!silent) console.log(`[@elysiajs/static] prewarmed ${Math.min(loaded, prewarmMaxFiles)} file(s)`)
+  }
 
-    app
-      .onError(() => {})
-      .get(`${prefix}/*`, async ({params, headers: requestHeaders}) => {
-        const pathName = normalizePath(
-          path.join(assetsDir, decodeURI ? (fastDecodeURI(params['*']) ?? params['*']) : params['*'])
-        )
+  // ---- register GET (and optional HEAD) wildcard routes ----
+  app.get(`${_prefix}*`, async ctx => {
+    return serveWildcard(ctx)
+  })
 
-        if (shouldIgnore(pathName)) throw new NotFoundError()
-
-        const cache = fileCache.get(pathName)
-        if (cache) return cache.clone()
-
-        try {
-          const fileStat = await fs.stat(pathName).catch(() => null)
-          if (!fileStat) throw new NotFoundError()
-
-          if (!indexHTML && fileStat.isDirectory()) throw new NotFoundError()
-
-          // @ts-expect-error
-          let file: NonNullable<Awaited<ReturnType<typeof getFile>>> | undefined
-
-          if (!isBun && indexHTML) {
-            const htmlPath = path.join(pathName, 'index.html')
-            const cache = fileCache.get(htmlPath)
-            if (cache) return cache.clone()
-
-            if (await fileExists(htmlPath)) file = await getFile(htmlPath)
-          }
-
-          if (!file && !fileStat.isDirectory() && (await fileExists(pathName))) file = await getFile(pathName)
-          else throw new NotFoundError()
-
-          if (!useETag) return new Response(file, isNotEmpty(initialHeaders) ? {headers: initialHeaders} : undefined)
-
-          const etag = await generateETag(file)
-          if (etag && (await isCached(requestHeaders, etag, pathName)))
-            return new Response(null, {
-              status: 304,
-            })
-
-          const response = new Response(file, {
-            headers: Object.assign(
-              {
-                'Cache-Control': maxAge ? `${directive}, max-age=${maxAge}` : directive,
-              },
-              initialHeaders,
-              etag ? {Etag: etag} : {}
-            ),
-          })
-
-          fileCache.set(pathName, response)
-
-          return response.clone()
-        } catch (error) {
-          if (error instanceof NotFoundError) throw error
-          if (!silent) console.error(`[@elysiajs/static]`, error)
-
-          throw new NotFoundError()
-        }
-      })
+  if (enableHEAD) {
+    app.head(`${_prefix}*`, async ctx => {
+      const res = await serveWildcard(ctx)
+      // HEAD：只返回 headers/status
+      return new Response(null, {status: res.status, headers: res.headers})
+    })
   }
 
   return app
+
+  // ---- wildcard handler ----
+  async function serveWildcard(ctx: any): Promise<Response> {
+    const url = new URL(ctx.request.url)
+    const reqHeaders = headersToObject(ctx.request.headers)
+    const encoding: Encoding = preCompressed ? negotiateEncoding(reqHeaders['accept-encoding']) : undefined
+    const star = (ctx.params as any)['*'] || ''
+    let reqPath = `/${star}`
+
+    if (decodeURI) reqPath = fastDecodeURI(reqPath) ?? reqPath
+
+    // 支持多个静态目录
+    for (const root of roots) {
+      const full = requirePath(root, reqPath)
+      const st = await statSafe(fs, full)
+
+      // 目录处理
+      if (st?.isDirectory() && indexHTML) {
+        // 目录自动追加 /index.html
+        for (const name of indexFiles) {
+          const idxReq = reqPath.endsWith('/') ? reqPath + name : reqPath + '/' + name
+          const idxFull = requirePath(root, idxReq)
+          const r = await tryServe(idxFull, idxReq, reqHeaders, encoding, {
+            devMode,
+            initialHeaders,
+            maxAge,
+            directive,
+            useETag,
+          })
+          if (r) return r
+        }
+        continue
+      }
+
+      // 普通文件
+      const r = await tryServe(full, reqPath, reqHeaders, encoding, {
+        devMode,
+        initialHeaders,
+        maxAge,
+        directive,
+        useETag,
+      })
+      if (r) return r
+    }
+
+    throw new NotFoundError()
+  }
+
+  // ---- file serve with cache strategy ----
+  async function tryServe(
+    fullPath: string,
+    urlPath: string,
+    reqHeaders: Record<string, string>,
+    enc: Encoding,
+    {
+      devMode,
+      initialHeaders,
+      maxAge,
+      directive,
+      useETag,
+    }: {
+      devMode: boolean
+      initialHeaders?: Record<string, string>
+      maxAge: number
+      directive: string
+      useETag: boolean
+    }
+  ) {
+    const fsmod = (await getBuiltinModule())![0]
+
+    // 预压缩优先：.br/.gz
+    const encFull = enc ? `${fullPath}.${enc === 'br' ? 'br' : 'gz'}` : undefined
+
+    // 1) 缓存命中：预压缩
+    if (encFull) {
+      const ck = cacheKey(encFull, enc)
+      const ce = cache.get(ck)
+      if (ce) {
+        if (devMode) {
+          const st = await statSafe(fsmod, encFull)
+          if (!st) {
+            cache.delete(ck)
+          } else if (ce.mtimeMs !== st.mtimeMs) {
+            const body = isBun ? getFile(encFull) : await getFile(encFull)
+            const et = useETag ? await generateETag(body as any) : undefined
+            ce.body = body
+            ce.etag = et
+            ce.mtimeMs = st.mtimeMs
+            ce.size = st.size
+          }
+        }
+        touch(ce)
+        return buildResponse(ce, urlPath, initialHeaders, {maxAge, directive}, enc)
+      }
+    }
+
+    // 2) 缓存命中：非预压缩
+    {
+      const ck = cacheKey(fullPath)
+      const ce = cache.get(ck)
+      if (ce) {
+        if (devMode) {
+          const st = await statSafe(fsmod, fullPath)
+          if (!st) {
+            cache.delete(ck)
+          } else if (ce.mtimeMs !== st.mtimeMs) {
+            const body = isBun ? getFile(fullPath) : await getFile(fullPath)
+            const et = useETag ? await generateETag(body as any) : undefined
+            ce.body = body
+            ce.etag = et
+            ce.mtimeMs = st.mtimeMs
+            ce.size = st.size
+          }
+        }
+        // ETag / 304
+        if (useETag && ce.etag && (await isCached(reqHeaders, ce.etag, fullPath))) {
+          const h = new Headers(initialHeaders ?? {})
+          return new Response(null, {status: 304, headers: h})
+        }
+        touch(ce)
+        return buildResponse(ce, urlPath, initialHeaders, {maxAge, directive})
+      }
+    }
+
+    // 3) 缓存未命中：从磁盘读取并加入缓存（生产模式=首次访问动态加缓存；开发模式=首次读入并记录 mtime）
+    if (encFull && (await fileExists(encFull))) {
+      const body = isBun ? getFile(encFull) : await getFile(encFull)
+      const st = await statSafe(fsmod, encFull)
+      const et = useETag ? await generateETag(body as any) : undefined
+      const entry: CacheEntry = {
+        body,
+        etag: et,
+        mtimeMs: st?.mtimeMs,
+        size: st?.size ?? 0,
+        hits: 0,
+        lastAccess: Date.now(),
+        prewarmed: false,
+      }
+      putCache(cacheKey(encFull, enc), entry)
+      return buildResponse(entry, urlPath, initialHeaders, {maxAge, directive}, enc)
+    }
+
+    if (await fileExists(fullPath)) {
+      const body = isBun ? getFile(fullPath) : await getFile(fullPath)
+      const st = await statSafe(fsmod, fullPath)
+      const et = useETag ? await generateETag(body as any) : undefined
+
+      if (useETag && et && (await isCached(reqHeaders, et, fullPath))) {
+        const h = new Headers(initialHeaders ?? {})
+        return new Response(null, {status: 304, headers: h})
+      }
+
+      const entry: CacheEntry = {
+        body,
+        etag: et,
+        mtimeMs: st?.mtimeMs,
+        size: st?.size ?? 0,
+        hits: 0,
+        lastAccess: Date.now(),
+        prewarmed: false,
+      }
+      putCache(cacheKey(fullPath), entry)
+      return buildResponse(entry, urlPath, initialHeaders, {maxAge, directive})
+    }
+
+    return null
+  }
+
+  function buildResponse(
+    entry: CacheEntry,
+    urlPath: string,
+    initialHeaders: Record<string, string> | undefined,
+    {maxAge, directive}: {maxAge: number; directive: string},
+    enc?: Encoding
+  ) {
+    const h = new Headers({
+      'Cache-Control': maxAge ? `${directive}, max-age=${maxAge}` : directive,
+      ...(initialHeaders ?? {}),
+    })
+    if (entry.etag) h.set('ETag', entry.etag)
+    const ct = guessContentType(urlPath)
+    if (ct) h.set('Content-Type', ct)
+    if (enc) h.set('Content-Encoding', enc)
+    touch(entry)
+    return new Response(entry.body as any, {headers: h})
+  }
 }
 
 export default staticPlugin
