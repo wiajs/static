@@ -6,6 +6,8 @@
 .cjs.swcrc
 .es.swcrc
 bun.lockb
+.prettierrcignore
+
 
 node_modules
 tsconfig.json
@@ -20,9 +22,11 @@ public-aliased
 test
 CHANGELOG.md
 .eslintrc.js
+biome.json
 tsconfig.cjs.json
 tsconfig.esm.json
 tsconfig.dts.json
 
 src
+bak
 build.ts

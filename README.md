@@ -33,6 +33,19 @@ app.use(staticPlugin({
 }))
 ```
 
+```js
+app.use(staticPlugin({
+  assets: ['public', 'assets'],
+  prefix: '/',                 // 根路径服务
+  preCompressed: true,
+  enableHEAD: true,            // 需要 HEAD 就开；只用 GET 也可
+  // 生产策略
+  prewarmEnable: process.env.NODE_ENV === 'production',
+  prewarmMaxFiles: 300,        // 预热最多 300 个
+  cacheMaxEntries: 1000,       // 缓存上限
+  cacheOvershoot: 200          // 超出 5200 时清理回 5000
+}))
+```
 
 ## Example
 ```typescript
