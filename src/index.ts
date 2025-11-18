@@ -217,13 +217,11 @@ export async function staticPlugin<const Prefix extends string = '/'>(
   }
 
   // ---- register GET (and optional HEAD) wildcard routes ----
-  app.get(`${_prefix}*`, async ctx => {
-    return serveWildcard(ctx)
-  })
+  app.get(`${_prefix}*`, ctx => serveWildcard(ctx, false))
 
   if (enableHEAD) {
     app.head(`${_prefix}*`, async ctx => {
-      const res = await serveWildcard(ctx)
+      const res = await serveWildcard(ctx, true)
       // HEAD：只返回 headers/status
       return new Response(null, {status: res.status, headers: res.headers})
     })
@@ -232,7 +230,7 @@ export async function staticPlugin<const Prefix extends string = '/'>(
   return app
 
   // ---- wildcard handler ----
-  async function serveWildcard(ctx: any): Promise<Response> {
+  async function serveWildcard(ctx: any, isHead: boolean): Promise<Response> {
     const url = new URL(ctx.request.url)
     const reqHeaders = headersToObject(ctx.request.headers)
     const encoding: Encoding = preCompressed ? negotiateEncoding(reqHeaders['accept-encoding']) : undefined
@@ -243,7 +241,19 @@ export async function staticPlugin<const Prefix extends string = '/'>(
 
     // 支持多个静态目录
     for (const root of roots) {
-      const full = requirePath(root, reqPath)
+      let full: string
+      try {
+        full = requirePath(root, reqPath)
+      } catch {
+        continue
+      }
+
+      // [Security Fix #2] Prevent Path Traversal
+      if (!full.startsWith(root)) continue
+
+      // [Security Fix #1] Check ignore patterns for dynamic requests
+      if (ignore(full)) continue
+
       const st = await statSafe(fs, full)
 
       // 目录处理
@@ -251,13 +261,24 @@ export async function staticPlugin<const Prefix extends string = '/'>(
         // 目录自动追加 /index.html
         for (const name of indexFiles) {
           const idxReq = reqPath.endsWith('/') ? reqPath + name : reqPath + '/' + name
-          const idxFull = requirePath(root, idxReq)
+          let idxFull: string
+          try {
+            idxFull = requirePath(root, idxReq)
+          } catch {
+            continue
+          }
+
+          // 对 index 文件也做同样的安全检查
+          if (!idxFull.startsWith(root)) continue
+          if (ignore(idxFull)) continue
+
           const r = await tryServe(idxFull, idxReq, reqHeaders, encoding, {
             devMode,
             initialHeaders,
             maxAge,
             directive,
             useETag,
+            isHead,
           })
           if (r) return r
         }
@@ -271,6 +292,7 @@ export async function staticPlugin<const Prefix extends string = '/'>(
         maxAge,
         directive,
         useETag,
+        isHead,
       })
       if (r) return r
     }
@@ -290,12 +312,14 @@ export async function staticPlugin<const Prefix extends string = '/'>(
       maxAge,
       directive,
       useETag,
+      isHead,
     }: {
       devMode: boolean
       initialHeaders?: Record<string, string>
       maxAge: number
       directive: string
       useETag: boolean
+      isHead: boolean
     }
   ) {
     const fsmod = (await getBuiltinModule())![0]
@@ -303,62 +327,73 @@ export async function staticPlugin<const Prefix extends string = '/'>(
     // 预压缩优先：.br/.gz
     const encFull = enc ? `${fullPath}.${enc === 'br' ? 'br' : 'gz'}` : undefined
 
-    // 1) 缓存命中：预压缩
+    // Helper: refresh cache logic
+    const checkRefresh = async (ck: string, ce: CacheEntry, path: string) => {
+      const st = await statSafe(fsmod, path)
+      if (!st) {
+        cache.delete(ck)
+        return null
+      } else if (ce.mtimeMs !== st.mtimeMs) {
+        const body = isBun ? getFile(path) : await getFile(path)
+        // [Fix #4] If HEAD request, skip heavy ETag generation if not cached
+        const et = useETag && !isHead ? await generateETag(body as any) : undefined
+        ce.body = body
+        ce.etag = et
+        ce.mtimeMs = st.mtimeMs
+        ce.size = st.size
+      }
+      return ce
+    }
+
+    // 1) Cache hit: Compressed
     if (encFull) {
       const ck = cacheKey(encFull, enc)
-      const ce = cache.get(ck)
+      let ce = cache.get(ck)
       if (ce) {
+        let isValid = true // 引入有效性标记
         if (devMode) {
-          const st = await statSafe(fsmod, encFull)
-          if (!st) {
-            cache.delete(ck)
-          } else if (ce.mtimeMs !== st.mtimeMs) {
-            const body = isBun ? getFile(encFull) : await getFile(encFull)
-            const et = useETag ? await generateETag(body as any) : undefined
-            ce.body = body
-            ce.etag = et
-            ce.mtimeMs = st.mtimeMs
-            ce.size = st.size
-          }
+          const refreshed = await checkRefresh(ck, ce, encFull)
+          if (!refreshed) isValid = false
+          else ce = refreshed
         }
-        touch(ce)
-        return buildResponse(ce, urlPath, initialHeaders, {maxAge, directive}, enc)
+        if (isValid) {
+          touch(ce)
+          return buildResponse(ce, urlPath, initialHeaders, {maxAge, directive}, reqHeaders, enc)
+        }
       }
     }
 
-    // 2) 缓存命中：非预压缩
+    // 2) Cache hit: Standard
     {
       const ck = cacheKey(fullPath)
-      const ce = cache.get(ck)
+      let ce = cache.get(ck)
       if (ce) {
+        let isValid = true // 引入有效性标记
         if (devMode) {
-          const st = await statSafe(fsmod, fullPath)
-          if (!st) {
-            cache.delete(ck)
-          } else if (ce.mtimeMs !== st.mtimeMs) {
-            const body = isBun ? getFile(fullPath) : await getFile(fullPath)
-            const et = useETag ? await generateETag(body as any) : undefined
-            ce.body = body
-            ce.etag = et
-            ce.mtimeMs = st.mtimeMs
-            ce.size = st.size
+          const refreshed = await checkRefresh(ck, ce, fullPath)
+          if (!refreshed) isValid = false
+          else ce = refreshed
+        }
+
+        if (isValid) {
+          // ETag / 304
+          if (useETag && ce.etag && (await isCached(reqHeaders, ce.etag, fullPath))) {
+            const h = new Headers(initialHeaders ?? {})
+            return new Response(null, {status: 304, headers: h})
           }
+          touch(ce)
+          return buildResponse(ce, urlPath, initialHeaders, {maxAge, directive}, reqHeaders)
         }
-        // ETag / 304
-        if (useETag && ce.etag && (await isCached(reqHeaders, ce.etag, fullPath))) {
-          const h = new Headers(initialHeaders ?? {})
-          return new Response(null, {status: 304, headers: h})
-        }
-        touch(ce)
-        return buildResponse(ce, urlPath, initialHeaders, {maxAge, directive})
       }
     }
 
-    // 3) 缓存未命中：从磁盘读取并加入缓存（生产模式=首次访问动态加缓存；开发模式=首次读入并记录 mtime）
+    // 3) Cache Miss: Read from disk
+    // Try compressed first
     if (encFull && (await fileExists(encFull))) {
       const body = isBun ? getFile(encFull) : await getFile(encFull)
       const st = await statSafe(fsmod, encFull)
-      const et = useETag ? await generateETag(body as any) : undefined
+      // [Fix #4] Skip ETag for HEAD to avoid full read latency
+      const et = useETag && !isHead ? await generateETag(body as any) : undefined
       const entry: CacheEntry = {
         body,
         etag: et,
@@ -369,13 +404,14 @@ export async function staticPlugin<const Prefix extends string = '/'>(
         prewarmed: false,
       }
       putCache(cacheKey(encFull, enc), entry)
-      return buildResponse(entry, urlPath, initialHeaders, {maxAge, directive}, enc)
+      return buildResponse(entry, urlPath, initialHeaders, {maxAge, directive}, reqHeaders, enc)
     }
 
+    // Try standard
     if (await fileExists(fullPath)) {
       const body = isBun ? getFile(fullPath) : await getFile(fullPath)
       const st = await statSafe(fsmod, fullPath)
-      const et = useETag ? await generateETag(body as any) : undefined
+      const et = useETag && !isHead ? await generateETag(body as any) : undefined
 
       if (useETag && et && (await isCached(reqHeaders, et, fullPath))) {
         const h = new Headers(initialHeaders ?? {})
@@ -392,7 +428,7 @@ export async function staticPlugin<const Prefix extends string = '/'>(
         prewarmed: false,
       }
       putCache(cacheKey(fullPath), entry)
-      return buildResponse(entry, urlPath, initialHeaders, {maxAge, directive})
+      return buildResponse(entry, urlPath, initialHeaders, {maxAge, directive}, reqHeaders)
     }
 
     return null
@@ -403,18 +439,46 @@ export async function staticPlugin<const Prefix extends string = '/'>(
     urlPath: string,
     initialHeaders: Record<string, string> | undefined,
     {maxAge, directive}: {maxAge: number; directive: string},
+    reqHeaders: Record<string, string>, // Needed for Range check
     enc?: Encoding
   ) {
     const h = new Headers({
       'Cache-Control': maxAge ? `${directive}, max-age=${maxAge}` : directive,
+      Vary: 'Accept-Encoding', // [Logic Fix #3] 告知缓存响应内容取决于 Accept-Encoding
+      'Accept-Ranges': 'bytes', // Advertise Range support
       ...(initialHeaders ?? {}),
     })
     if (entry.etag) h.set('ETag', entry.etag)
     const ct = guessContentType(urlPath)
     if (ct) h.set('Content-Type', ct)
     if (enc) h.set('Content-Encoding', enc)
+
     touch(entry)
-    return new Response(entry.body as any, {headers: h})
+
+    const body = entry.body
+
+    // [Fix #5] Node.js Range Support
+    // Bun.file() handles range automatically, but Buffer (Node.js) does not.
+    if (!isBun && reqHeaders['range'] && Buffer.isBuffer(body)) {
+      const range = reqHeaders['range']
+      const size = entry.size
+      const parts = range.replace(/bytes=/, '').split('-')
+      const start = parseInt(parts[0], 10)
+      const end = parts[1] ? parseInt(parts[1], 10) : size - 1
+
+      // Check if range is valid
+      if (!isNaN(start) && !isNaN(end) && start <= end && end < size) {
+        h.set('Content-Range', `bytes ${start}-${end}/${size}`)
+        h.set('Content-Length', (end - start + 1).toString())
+        // Return 206 Partial Content
+        return new Response(body.subarray(start, end + 1), {
+          status: 206,
+          headers: h,
+        })
+      }
+    }
+
+    return new Response(body as any, {headers: h})
   }
 }
 
