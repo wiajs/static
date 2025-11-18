@@ -28,9 +28,9 @@ const DEFAULTS = {
   enableHEAD: true,
   ignorePatterns: ['.DS_Store', '.git', '.env'],
   prewarmEnable: process.env.NODE_ENV === 'production',
-  prewarmMaxFiles: 300,
-  cacheMaxEntries: process.env.NODE_ENV === 'production' ? 1000 : 400,
-  cacheOvershoot: 200,
+  prewarmMaxFiles: 300, // 依然保留作为防止遍历过深的保险
+  cacheMaxSize: 30, // 30 MB
+  cacheOvershootSize: 50, // 50 MB
 }
 
 // -------- helpers --------
@@ -51,32 +51,20 @@ function negotiateEncoding(ae: string | null | undefined): Encoding {
 function guessContentType(p: string) {
   const ext = p.split('?')[0].split('#')[0].split('.').pop()?.toLowerCase()
   switch (ext) {
-    case 'html':
-      return 'text/html; charset=utf-8'
-    case 'css':
-      return 'text/css; charset=utf-8'
+    case 'html': return 'text/html; charset=utf-8'
+    case 'css': return 'text/css; charset=utf-8'
     case 'js':
-    case 'mjs':
-      return 'application/javascript; charset=utf-8'
-    case 'json':
-      return 'application/json; charset=utf-8'
-    case 'svg':
-      return 'image/svg+xml'
-    case 'png':
-      return 'image/png'
+    case 'mjs': return 'application/javascript; charset=utf-8'
+    case 'json': return 'application/json; charset=utf-8'
+    case 'svg': return 'image/svg+xml'
+    case 'png': return 'image/png'
     case 'jpg':
-    case 'jpeg':
-      return 'image/jpeg'
-    case 'webp':
-      return 'image/webp'
-    case 'ico':
-      return 'image/x-icon'
-    case 'woff':
-      return 'font/woff'
-    case 'woff2':
-      return 'font/woff2'
-    default:
-      return undefined
+    case 'jpeg': return 'image/jpeg'
+    case 'webp': return 'image/webp'
+    case 'ico': return 'image/x-icon'
+    case 'woff': return 'font/woff'
+    case 'woff2': return 'font/woff2'
+    default: return undefined
   }
 }
 
@@ -138,8 +126,9 @@ export async function staticPlugin<const Prefix extends string = '/'>(
     // cache/prewarm
     prewarmEnable = DEFAULTS.prewarmEnable,
     prewarmMaxFiles = DEFAULTS.prewarmMaxFiles,
-    cacheMaxEntries = DEFAULTS.cacheMaxEntries,
-    cacheOvershoot = DEFAULTS.cacheOvershoot,
+    // Cache Size Control (MB)
+    cacheMaxSize = DEFAULTS.cacheMaxSize,
+    cacheOvershootSize = DEFAULTS.cacheOvershootSize,
   } = opts
 
   if (typeof process === 'undefined' || typeof (process as any).getBuiltinModule === 'undefined') {
@@ -160,6 +149,9 @@ export async function staticPlugin<const Prefix extends string = '/'>(
 
   // ---- cache container ----
   const cache = new Map<string, CacheEntry>() // key: fullPath(.br/.gz 可带编码后缀)
+  let currentCacheSize = 0 // bytes
+  const MAX_SIZE_BYTES = cacheMaxSize * 1024 * 1024
+  const OVERSHOOT_BYTES = cacheOvershootSize * 1024 * 1024
 
   function touch(entry: CacheEntry) {
     entry.hits += 1
@@ -167,53 +159,79 @@ export async function staticPlugin<const Prefix extends string = '/'>(
   }
 
   function putCache(key: string, entry: CacheEntry) {
+    const existing = cache.get(key)
+    if (existing) {
+      currentCacheSize -= existing.size
+    }
     cache.set(key, entry)
+    currentCacheSize += entry.size
     maybeCleanup()
   }
 
+  function removeCache(key: string) {
+    const existing = cache.get(key)
+    if (existing) {
+      currentCacheSize -= existing.size
+      cache.delete(key)
+    }
+  }
+
   function maybeCleanup() {
-    const limit = cacheMaxEntries
-    const overshoot = cacheOvershoot
-    if (cache.size <= limit + overshoot) return
+    if (currentCacheSize <= OVERSHOOT_BYTES) return
 
     const arr = Array.from(cache.entries())
-    // hits 升序 + lastAccess 升序（命中少且最久未访问优先被清）
+    // hits 升序 + lastAccess 升序（优先清理命中少且最久未访问的）
     arr.sort((a, b) => {
-      const ea = a[1],
-        eb = b[1]
+      const ea = a[1], eb = b[1]
       if (ea.hits !== eb.hits) return ea.hits - eb.hits
       return ea.lastAccess - eb.lastAccess
     })
-    const toRemove = arr.length - limit
-    for (let i = 0; i < toRemove; i++) cache.delete(arr[i][0])
+
+    for (const [key, entry] of arr) {
+      if (currentCacheSize <= MAX_SIZE_BYTES) break
+      cache.delete(key)
+      currentCacheSize -= entry.size
+    }
   }
 
   // ---- production prewarm（仅预热前 N 个文件；不热更）----
   if (prewarmEnable) {
-    let loaded = 0
+    let loadedFiles = 0
     for (const root of roots) {
       const files = await listFiles(root).catch(() => [])
       for (const fileAbs of files) {
-        if (loaded >= prewarmMaxFiles) break
+        if (loadedFiles >= prewarmMaxFiles) break
         if (!fileAbs || ignore(fileAbs)) continue
+
+        const st = await statSafe(fs, fileAbs)
+        if (!st) continue
+
+        // Check size limit before reading content
+        if (currentCacheSize + st.size > MAX_SIZE_BYTES) {
+          // Stop prewarming if we hit the target size
+          break 
+        }
+
         // 不对目录做预热，这里 files 已经是平铺文件集合
         const body = isBun ? getFile(fileAbs) : await getFile(fileAbs)
-        const st = await statSafe(fs, fileAbs)
         const et = useETag ? await generateETag(body as any) : undefined
+        
         putCache(cacheKey(fileAbs), {
           body,
           etag: et,
           mtimeMs: st?.mtimeMs,
-          size: st?.size ?? 0,
+          size: st.size ?? 0,
           hits: 0,
           lastAccess: Date.now(),
           prewarmed: true,
         })
-        loaded++
+        loadedFiles++
       }
-      if (loaded >= prewarmMaxFiles) break
+      if (currentCacheSize >= MAX_SIZE_BYTES) break
     }
-    if (!silent) console.log(`[@elysiajs/static] prewarmed ${Math.min(loaded, prewarmMaxFiles)} file(s)`)
+    if (!silent) {
+        console.log(`[@wiajsjs/static] prewarmed ${loadedFiles} file(s), ${(currentCacheSize / 1024 / 1024).toFixed(2)} MB`)
+    }
   }
 
   // ---- register GET (and optional HEAD) wildcard routes ----
@@ -262,23 +280,14 @@ export async function staticPlugin<const Prefix extends string = '/'>(
         for (const name of indexFiles) {
           const idxReq = reqPath.endsWith('/') ? reqPath + name : reqPath + '/' + name
           let idxFull: string
-          try {
-            idxFull = requirePath(root, idxReq)
-          } catch {
-            continue
-          }
+          try { idxFull = requirePath(root, idxReq) } catch { continue }
 
           // 对 index 文件也做同样的安全检查
           if (!idxFull.startsWith(root)) continue
           if (ignore(idxFull)) continue
 
           const r = await tryServe(idxFull, idxReq, reqHeaders, encoding, {
-            devMode,
-            initialHeaders,
-            maxAge,
-            directive,
-            useETag,
-            isHead,
+            devMode, initialHeaders, maxAge, directive, useETag, isHead
           })
           if (r) return r
         }
@@ -287,12 +296,7 @@ export async function staticPlugin<const Prefix extends string = '/'>(
 
       // 普通文件
       const r = await tryServe(full, reqPath, reqHeaders, encoding, {
-        devMode,
-        initialHeaders,
-        maxAge,
-        directive,
-        useETag,
-        isHead,
+        devMode, initialHeaders, maxAge, directive, useETag, isHead
       })
       if (r) return r
     }
@@ -331,16 +335,21 @@ export async function staticPlugin<const Prefix extends string = '/'>(
     const checkRefresh = async (ck: string, ce: CacheEntry, path: string) => {
       const st = await statSafe(fsmod, path)
       if (!st) {
-        cache.delete(ck)
+        removeCache(ck) // Size aware remove
         return null
       } else if (ce.mtimeMs !== st.mtimeMs) {
         const body = isBun ? getFile(path) : await getFile(path)
         // [Fix #4] If HEAD request, skip heavy ETag generation if not cached
-        const et = useETag && !isHead ? await generateETag(body as any) : undefined
+        const et = (useETag && !isHead) ? await generateETag(body as any) : undefined
+        
+        // Update cache entry and size
+        currentCacheSize -= ce.size
         ce.body = body
         ce.etag = et
         ce.mtimeMs = st.mtimeMs
         ce.size = st.size
+        currentCacheSize += ce.size
+        maybeCleanup() // Check if update caused overshoot
       }
       return ce
     }
@@ -393,7 +402,7 @@ export async function staticPlugin<const Prefix extends string = '/'>(
       const body = isBun ? getFile(encFull) : await getFile(encFull)
       const st = await statSafe(fsmod, encFull)
       // [Fix #4] Skip ETag for HEAD to avoid full read latency
-      const et = useETag && !isHead ? await generateETag(body as any) : undefined
+      const et = (useETag && !isHead) ? await generateETag(body as any) : undefined
       const entry: CacheEntry = {
         body,
         etag: et,
@@ -411,7 +420,7 @@ export async function staticPlugin<const Prefix extends string = '/'>(
     if (await fileExists(fullPath)) {
       const body = isBun ? getFile(fullPath) : await getFile(fullPath)
       const st = await statSafe(fsmod, fullPath)
-      const et = useETag && !isHead ? await generateETag(body as any) : undefined
+      const et = (useETag && !isHead) ? await generateETag(body as any) : undefined
 
       if (useETag && et && (await isCached(reqHeaders, et, fullPath))) {
         const h = new Headers(initialHeaders ?? {})
@@ -444,7 +453,7 @@ export async function staticPlugin<const Prefix extends string = '/'>(
   ) {
     const h = new Headers({
       'Cache-Control': maxAge ? `${directive}, max-age=${maxAge}` : directive,
-      Vary: 'Accept-Encoding', // [Logic Fix #3] 告知缓存响应内容取决于 Accept-Encoding
+      'Vary': 'Accept-Encoding', // [Logic Fix #3] 告知缓存响应内容取决于 Accept-Encoding
       'Accept-Ranges': 'bytes', // Advertise Range support
       ...(initialHeaders ?? {}),
     })
@@ -455,7 +464,7 @@ export async function staticPlugin<const Prefix extends string = '/'>(
 
     touch(entry)
 
-    const body = entry.body
+    let body = entry.body
 
     // [Fix #5] Node.js Range Support
     // Bun.file() handles range automatically, but Buffer (Node.js) does not.

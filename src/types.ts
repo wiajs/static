@@ -19,9 +19,21 @@ export interface StaticOptions<Prefix extends string = '/'> {
 
   // —— 缓存与预热策略 ——
   prewarmEnable?: boolean // 生产默认 true，开发默认 false
-  prewarmMaxFiles?: number // 预热最多 N 个文件（生产）
-  cacheMaxEntries?: number // 缓存上限
-  cacheOvershoot?: number // 超限阈值(>max+overshoot 时清理到 max)
+  prewarmMaxFiles?: number // 预热扫描的最大文件数（防止扫描过多），但受 cacheMaxSize 限制
+  
+  /**
+   * 缓存目标大小 (MB)
+   * 达到清理阈值后，会将缓存清理至此大小
+   * @default 30
+   */
+  cacheMaxSize?: number
+
+  /**
+   * 缓存清理阈值 (MB)
+   * 当总缓存大小超过此值时，触发清理
+   * @default 50
+   */
+  cacheOvershootSize?: number
 
   /**
    * @default 1024
