@@ -2,6 +2,7 @@
 
 node_modules
 .pnpm-debug.log
-dist
+/dist
+/bak
 
 build
