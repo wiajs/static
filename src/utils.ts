@@ -72,63 +72,6 @@ export function fileExists(path: string) {
   )
 }
 
-export class LRUCache<K, V> {
-  private map = new Map<K, [V, number]>()
-  private interval: number | undefined
-
-  constructor(
-    private readonly max = 250,
-    private readonly ttl = 3 * 60 * 60
-  ) {}
-
-  get(key: K): V | undefined {
-    const entry = this.map.get(key)
-    if (!entry) return
-
-    if (entry[1] <= Date.now()) return void this.delete(key)
-
-    // refresh LRU order
-    this.map.delete(key)
-    this.map.set(key, entry)
-    return entry[0]
-  }
-
-  set(key: K, value: V): void {
-    if (!this.interval)
-      this.interval = setInterval(() => {
-        const now = Date.now()
-        for (const [key, entry] of this.map) if (entry[1] <= now) this.map.delete(key)
-      }, this.ttl) as unknown as number
-
-    if (this.map.has(key)) this.map.delete(key)
-    else if (this.map.size >= this.max) {
-      const oldestKey = this.map.keys().next().value
-
-      if (oldestKey !== undefined) this.delete(oldestKey)
-    }
-
-    this.map.set(key, [value, Date.now() + this.ttl * 1000])
-  }
-
-  delete(key: K): void {
-    if (!this.map.get(key)) return
-
-    this.map.delete(key)
-  }
-
-  clear(): void {
-    this.map.clear()
-  }
-
-  size(): number {
-    return this.map.size
-  }
-
-  [Symbol.dispose]() {
-    if (this.interval) clearInterval(this.interval)
-  }
-}
-
 export function isCached(headers: Record<string, string | undefined>, etag: string, filePath: string) {
   // Always return stale when Cache-Control: no-cache
   // to support end-to-end reload requests

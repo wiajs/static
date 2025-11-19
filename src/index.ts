@@ -1,18 +1,18 @@
 import {Elysia, NotFoundError} from 'elysia'
 import fastDecodeURI from 'fast-decode-uri-component'
+import {LRUCache} from 'lru-cache'
+import {contentType, lookup} from 'mime-types'
 import type {StaticOptions} from './types'
 import {fileExists, generateETag, getBuiltinModule, getFile, isBun, isCached, listFiles} from './utils'
 
 // -------- types --------
 type Encoding = 'br' | 'gzip' | undefined
 interface CacheEntry {
-  body: any // BunFile | Buffer
+  body?: any // BunFile | Buffer (Small files only for Node)
+  filePath: string // Absolute path for streaming
   etag?: string
   mtimeMs?: number // dev 模式用于热更新校验
   size: number
-  hits: number
-  lastAccess: number
-  prewarmed: boolean
 }
 
 // -------- defaults --------
@@ -49,23 +49,9 @@ function negotiateEncoding(ae: string | null | undefined): Encoding {
 }
 
 function guessContentType(p: string) {
-  const ext = p.split('?')[0].split('#')[0].split('.').pop()?.toLowerCase()
-  switch (ext) {
-    case 'html': return 'text/html; charset=utf-8'
-    case 'css': return 'text/css; charset=utf-8'
-    case 'js':
-    case 'mjs': return 'application/javascript; charset=utf-8'
-    case 'json': return 'application/json; charset=utf-8'
-    case 'svg': return 'image/svg+xml'
-    case 'png': return 'image/png'
-    case 'jpg':
-    case 'jpeg': return 'image/jpeg'
-    case 'webp': return 'image/webp'
-    case 'ico': return 'image/x-icon'
-    case 'woff': return 'font/woff'
-    case 'woff2': return 'font/woff2'
-    default: return undefined
-  }
+  const mime = lookup(p)
+  if (!mime) return 'application/octet-stream'
+  return contentType(mime) || mime
 }
 
 function assetsToRoots(assets: string | string[]) {
@@ -139,6 +125,7 @@ export async function staticPlugin<const Prefix extends string = '/'>(
   const builtin = getBuiltinModule()
   if (!builtin) return new Elysia()
   const [fs] = builtin
+  const fsNative = !isBun ? (process as any).getBuiltinModule('fs') : null
 
   const roots = assetsToRoots(assets)
   const _prefix = normalizePrefix(String(prefix))
@@ -148,51 +135,11 @@ export async function staticPlugin<const Prefix extends string = '/'>(
   const app = new Elysia({name: 'static', seed: _prefix})
 
   // ---- cache container ----
-  const cache = new Map<string, CacheEntry>() // key: fullPath(.br/.gz 可带编码后缀)
-  let currentCacheSize = 0 // bytes
-  const MAX_SIZE_BYTES = cacheMaxSize * 1024 * 1024
-  const OVERSHOOT_BYTES = cacheOvershootSize * 1024 * 1024
-
-  function touch(entry: CacheEntry) {
-    entry.hits += 1
-    entry.lastAccess = Date.now()
-  }
-
-  function putCache(key: string, entry: CacheEntry) {
-    const existing = cache.get(key)
-    if (existing) {
-      currentCacheSize -= existing.size
-    }
-    cache.set(key, entry)
-    currentCacheSize += entry.size
-    maybeCleanup()
-  }
-
-  function removeCache(key: string) {
-    const existing = cache.get(key)
-    if (existing) {
-      currentCacheSize -= existing.size
-      cache.delete(key)
-    }
-  }
-
-  function maybeCleanup() {
-    if (currentCacheSize <= OVERSHOOT_BYTES) return
-
-    const arr = Array.from(cache.entries())
-    // hits 升序 + lastAccess 升序（优先清理命中少且最久未访问的）
-    arr.sort((a, b) => {
-      const ea = a[1], eb = b[1]
-      if (ea.hits !== eb.hits) return ea.hits - eb.hits
-      return ea.lastAccess - eb.lastAccess
-    })
-
-    for (const [key, entry] of arr) {
-      if (currentCacheSize <= MAX_SIZE_BYTES) break
-      cache.delete(key)
-      currentCacheSize -= entry.size
-    }
-  }
+  const cache = new LRUCache<string, CacheEntry>({
+    maxSize: cacheMaxSize * 1024 * 1024,
+    // Estimate size: file size + overhead (approx 200 bytes)
+    sizeCalculation: val => val.size + 200,
+  })
 
   // ---- production prewarm（仅预热前 N 个文件；不热更）----
   if (prewarmEnable) {
@@ -207,30 +154,39 @@ export async function staticPlugin<const Prefix extends string = '/'>(
         if (!st) continue
 
         // Check size limit before reading content
-        if (currentCacheSize + st.size > MAX_SIZE_BYTES) {
-          // Stop prewarming if we hit the target size
-          break 
-        }
+        // LRUCache handles eviction, but we stop scanning if too many files
+        // 1. 检查文件数量限制
+        if (cache.size >= prewarmMaxFiles) break
+
+        // [新增修复] 2. 检查缓存容量限制 (避免颠簸)
+        // cache.currentSize 是当前已使用的总大小
+        // cache.maxSize 是最大限制
+        // st.size + 200 是新文件预估大小 (包含 overhead)
+        const estimatedEntrySize = st.size + 200
+
+        // 如果单个文件就超过了总容量，跳过（避免读取）
+        if (estimatedEntrySize > cache.maxSize) continue
+
+        // 如果加入该文件会撑爆缓存，则停止预热（不再读取后续文件）
+        // 这样保留的是文件系统顺序中靠前的 N 个文件，通常是更好的策略
+        if (cache.currentSize + estimatedEntrySize > cache.maxSize) break
 
         // 不对目录做预热，这里 files 已经是平铺文件集合
         const body = isBun ? getFile(fileAbs) : await getFile(fileAbs)
         const et = useETag ? await generateETag(body as any) : undefined
-        
-        putCache(cacheKey(fileAbs), {
+
+        cache.set(cacheKey(fileAbs), {
           body,
+          filePath: fileAbs,
           etag: et,
           mtimeMs: st?.mtimeMs,
           size: st.size ?? 0,
-          hits: 0,
-          lastAccess: Date.now(),
-          prewarmed: true,
         })
         loadedFiles++
       }
-      if (currentCacheSize >= MAX_SIZE_BYTES) break
     }
     if (!silent) {
-        console.log(`[@wiajsjs/static] prewarmed ${loadedFiles} file(s), ${(currentCacheSize / 1024 / 1024).toFixed(2)} MB`)
+      console.log(`[@wiajsjs/static] prewarmed ${loadedFiles} file(s)`)
     }
   }
 
@@ -257,6 +213,7 @@ export async function staticPlugin<const Prefix extends string = '/'>(
 
     if (decodeURI) reqPath = fastDecodeURI(reqPath) ?? reqPath
 
+    const [, path] = builtin
     // 支持多个静态目录
     for (const root of roots) {
       let full: string
@@ -266,8 +223,9 @@ export async function staticPlugin<const Prefix extends string = '/'>(
         continue
       }
 
-      // [Security Fix #2] Prevent Path Traversal
-      if (!full.startsWith(root)) continue
+      // [Security Fix #2] Prevent Path Traversal (Windows Safe)
+      const rel = path.relative(root, full)
+      if (rel.startsWith('..') || path.isAbsolute(rel)) continue
 
       // [Security Fix #1] Check ignore patterns for dynamic requests
       if (ignore(full)) continue
@@ -283,7 +241,9 @@ export async function staticPlugin<const Prefix extends string = '/'>(
           try { idxFull = requirePath(root, idxReq) } catch { continue }
 
           // 对 index 文件也做同样的安全检查
-          if (!idxFull.startsWith(root)) continue
+          const idxRel = path.relative(root, idxFull)
+          if (idxRel.startsWith('..') || path.isAbsolute(idxRel)) continue
+
           if (ignore(idxFull)) continue
 
           const r = await tryServe(idxFull, idxReq, reqHeaders, encoding, {
@@ -335,21 +295,30 @@ export async function staticPlugin<const Prefix extends string = '/'>(
     const checkRefresh = async (ck: string, ce: CacheEntry, path: string) => {
       const st = await statSafe(fsmod, path)
       if (!st) {
-        removeCache(ck) // Size aware remove
+        cache.delete(ck)
         return null
       } else if (ce.mtimeMs !== st.mtimeMs) {
-        const body = isBun ? getFile(path) : await getFile(path)
+        // Refetch
+        const isLarge = st.size > 5 * 1024 * 1024 // 5MB
+        let body: any
+        // Only cache body for small files in Node, or always in Bun (lazy)
+        if (isBun || !isLarge) {
+          body = isBun ? getFile(path) : await getFile(path)
+        }
+
         // [Fix #4] If HEAD request, skip heavy ETag generation if not cached
-        const et = (useETag && !isHead) ? await generateETag(body as any) : undefined
-        
-        // Update cache entry and size
-        currentCacheSize -= ce.size
+        // For large files in Node, use Weak ETag to avoid full read
+        const et =
+          useETag && !isHead
+            ? !isBun && isLarge
+              ? `W/"${st.size.toString(16)}-${st.mtimeMs}"`
+              : await generateETag(body)
+            : undefined
+
         ce.body = body
         ce.etag = et
         ce.mtimeMs = st.mtimeMs
         ce.size = st.size
-        currentCacheSize += ce.size
-        maybeCleanup() // Check if update caused overshoot
       }
       return ce
     }
@@ -366,7 +335,6 @@ export async function staticPlugin<const Prefix extends string = '/'>(
           else ce = refreshed
         }
         if (isValid) {
-          touch(ce)
           return buildResponse(ce, urlPath, initialHeaders, {maxAge, directive}, reqHeaders, enc)
         }
       }
@@ -390,7 +358,6 @@ export async function staticPlugin<const Prefix extends string = '/'>(
             const h = new Headers(initialHeaders ?? {})
             return new Response(null, {status: 304, headers: h})
           }
-          touch(ce)
           return buildResponse(ce, urlPath, initialHeaders, {maxAge, directive}, reqHeaders)
         }
       }
@@ -402,25 +369,35 @@ export async function staticPlugin<const Prefix extends string = '/'>(
       const body = isBun ? getFile(encFull) : await getFile(encFull)
       const st = await statSafe(fsmod, encFull)
       // [Fix #4] Skip ETag for HEAD to avoid full read latency
-      const et = (useETag && !isHead) ? await generateETag(body as any) : undefined
+      const et = useETag && !isHead ? await generateETag(body as any) : undefined
       const entry: CacheEntry = {
         body,
+        filePath: encFull,
         etag: et,
         mtimeMs: st?.mtimeMs,
         size: st?.size ?? 0,
-        hits: 0,
-        lastAccess: Date.now(),
-        prewarmed: false,
       }
-      putCache(cacheKey(encFull, enc), entry)
+      cache.set(cacheKey(encFull, enc), entry)
       return buildResponse(entry, urlPath, initialHeaders, {maxAge, directive}, reqHeaders, enc)
     }
 
     // Try standard
     if (await fileExists(fullPath)) {
-      const body = isBun ? getFile(fullPath) : await getFile(fullPath)
       const st = await statSafe(fsmod, fullPath)
-      const et = (useETag && !isHead) ? await generateETag(body as any) : undefined
+
+      // Strategy: Don't cache large file bodies in Node memory
+      const isLarge = (st?.size ?? 0) > 5 * 1024 * 1024 // 5MB
+      let body: any
+      if (isBun || !isLarge) {
+        body = isBun ? getFile(fullPath) : await getFile(fullPath)
+      }
+
+      const et =
+        useETag && !isHead
+          ? !isBun && isLarge
+            ? `W/"${st?.size.toString(16)}-${st?.mtimeMs}"`
+            : await generateETag(body)
+          : undefined
 
       if (useETag && et && (await isCached(reqHeaders, et, fullPath))) {
         const h = new Headers(initialHeaders ?? {})
@@ -429,14 +406,12 @@ export async function staticPlugin<const Prefix extends string = '/'>(
 
       const entry: CacheEntry = {
         body,
+        filePath: fullPath,
         etag: et,
         mtimeMs: st?.mtimeMs,
         size: st?.size ?? 0,
-        hits: 0,
-        lastAccess: Date.now(),
-        prewarmed: false,
       }
-      putCache(cacheKey(fullPath), entry)
+      cache.set(cacheKey(fullPath), entry)
       return buildResponse(entry, urlPath, initialHeaders, {maxAge, directive}, reqHeaders)
     }
 
@@ -453,7 +428,7 @@ export async function staticPlugin<const Prefix extends string = '/'>(
   ) {
     const h = new Headers({
       'Cache-Control': maxAge ? `${directive}, max-age=${maxAge}` : directive,
-      'Vary': 'Accept-Encoding', // [Logic Fix #3] 告知缓存响应内容取决于 Accept-Encoding
+      Vary: 'Accept-Encoding', // [Logic Fix #3] 告知缓存响应内容取决于 Accept-Encoding
       'Accept-Ranges': 'bytes', // Advertise Range support
       ...(initialHeaders ?? {}),
     })
@@ -462,31 +437,46 @@ export async function staticPlugin<const Prefix extends string = '/'>(
     if (ct) h.set('Content-Type', ct)
     if (enc) h.set('Content-Encoding', enc)
 
-    touch(entry)
-
-    let body = entry.body
+    const body = entry.body
 
     // [Fix #5] Node.js Range Support
     // Bun.file() handles range automatically, but Buffer (Node.js) does not.
-    if (!isBun && reqHeaders['range'] && Buffer.isBuffer(body)) {
+    if (!isBun && reqHeaders['range']) {
+      // If no cached body (large file), or checking range on Buffer
+      // We prefer streaming for Range in Node
       const range = reqHeaders['range']
       const size = entry.size
       const parts = range.replace(/bytes=/, '').split('-')
       const start = parseInt(parts[0], 10)
       const end = parts[1] ? parseInt(parts[1], 10) : size - 1
 
-      // Check if range is valid
       if (!isNaN(start) && !isNaN(end) && start <= end && end < size) {
         h.set('Content-Range', `bytes ${start}-${end}/${size}`)
         h.set('Content-Length', (end - start + 1).toString())
-        // Return 206 Partial Content
-        return new Response(body.subarray(start, end + 1), {
-          status: 206,
-          headers: h,
-        })
+
+        // Stream response
+        if (fsNative && fsNative.createReadStream) {
+          const stream = fsNative.createReadStream(entry.filePath, {start, end})
+          return new Response(stream as any, {status: 206, headers: h})
+        }
+
+        // Fallback to Buffer slice if body exists
+        if (body && Buffer.isBuffer(body)) {
+          return new Response(body.subarray(start, end + 1), {
+            status: 206,
+            headers: h,
+          })
+        }
       }
     }
 
+    // If Node.js large file miss (no body cached), stream it full
+    if (!isBun && !body && fsNative && fsNative.createReadStream) {
+      const stream = fsNative.createReadStream(entry.filePath)
+      return new Response(stream as any, {headers: h})
+    }
+
+    // Bun or Small file Node
     return new Response(body as any, {headers: h})
   }
 }
