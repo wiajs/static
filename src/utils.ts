@@ -73,9 +73,6 @@ export function fileExists(path: string) {
 }
 
 export function isCached(headers: Record<string, string | undefined>, etag: string, filePath: string) {
-  // Always return stale when Cache-Control: no-cache
-  // to support end-to-end reload requests
-  // https://tools.ietf.org/html/rfc2616#section-14.9.4
   if (headers['cache-control'] && /no-cache|no-store/.test(headers['cache-control'])) return false
 
   if ('if-none-match' in headers) {
@@ -89,15 +86,6 @@ export function isCached(headers: Record<string, string | undefined>, etag: stri
 
     if (isMatching) return true
 
-    /**
-     * A recipient MUST ignore If-Modified-Since if the request contains an
-     * If-None-Match header field; the condition in If-None-Match is considered
-     * to be a more accurate replacement for the condition in If-Modified-Since,
-     * and the two are only combined for the sake of interoperating with older
-     * intermediaries that might not implement If-None-Match.
-     *
-     * @see RFC 9110 section 13.1.3
-     */
     return false
   }
 
@@ -123,14 +111,15 @@ export function getFile(path: string) {
   return fs.readFile(path)
 }
 
-export async function generateETag(file: BunFile | Buffer<ArrayBufferLike>) {
+// Remove generic Buffer type and cast to any for update
+export async function generateETag(file: BunFile | Buffer) {
   if (isBun) return new Bun.CryptoHasher('md5').update(await (file as BunFile).arrayBuffer()).digest('base64')
 
   if (!Crypto) Crypto = process.getBuiltinModule('crypto')
   if (!Crypto) return void console.warn('[@elysiajs/static] crypto is required to generate etag.')
 
   return Crypto.createHash('md5')
-    .update(file as Buffer)
+        .update(file as any) 
     .digest('base64')
 }
 

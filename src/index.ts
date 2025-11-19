@@ -114,7 +114,6 @@ export async function staticPlugin<const Prefix extends string = '/'>(
     prewarmMaxFiles = DEFAULTS.prewarmMaxFiles,
     // Cache Size Control (MB)
     cacheMaxSize = DEFAULTS.cacheMaxSize,
-    cacheOvershootSize = DEFAULTS.cacheOvershootSize,
   } = opts
 
   if (typeof process === 'undefined' || typeof (process as any).getBuiltinModule === 'undefined') {
@@ -124,7 +123,9 @@ export async function staticPlugin<const Prefix extends string = '/'>(
 
   const builtin = getBuiltinModule()
   if (!builtin) return new Elysia()
-  const [fs] = builtin
+
+  // [Fix] 在这里直接解构出 path，此时 TypeScript 知道 builtin 一定存在
+  const [fs, path] = builtin
   const fsNative = !isBun ? (process as any).getBuiltinModule('fs') : null
 
   const roots = assetsToRoots(assets)
@@ -169,7 +170,7 @@ export async function staticPlugin<const Prefix extends string = '/'>(
 
         // 如果加入该文件会撑爆缓存，则停止预热（不再读取后续文件）
         // 这样保留的是文件系统顺序中靠前的 N 个文件，通常是更好的策略
-        if (cache.currentSize + estimatedEntrySize > cache.maxSize) break
+        if (cache.calculatedSize + estimatedEntrySize > cache.maxSize) break
 
         // 不对目录做预热，这里 files 已经是平铺文件集合
         const body = isBun ? getFile(fileAbs) : await getFile(fileAbs)
@@ -179,8 +180,8 @@ export async function staticPlugin<const Prefix extends string = '/'>(
           body,
           filePath: fileAbs,
           etag: et,
-          mtimeMs: st?.mtimeMs,
-          size: st.size ?? 0,
+          mtimeMs: st.mtimeMs || 0,
+          size: st.size || 0,
         })
         loadedFiles++
       }
@@ -213,7 +214,6 @@ export async function staticPlugin<const Prefix extends string = '/'>(
 
     if (decodeURI) reqPath = fastDecodeURI(reqPath) ?? reqPath
 
-    const [, path] = builtin
     // 支持多个静态目录
     for (const root of roots) {
       let full: string
@@ -238,7 +238,11 @@ export async function staticPlugin<const Prefix extends string = '/'>(
         for (const name of indexFiles) {
           const idxReq = reqPath.endsWith('/') ? reqPath + name : reqPath + '/' + name
           let idxFull: string
-          try { idxFull = requirePath(root, idxReq) } catch { continue }
+          try {
+            idxFull = requirePath(root, idxReq)
+          } catch {
+            continue
+          }
 
           // 对 index 文件也做同样的安全检查
           const idxRel = path.relative(root, idxFull)
@@ -247,7 +251,12 @@ export async function staticPlugin<const Prefix extends string = '/'>(
           if (ignore(idxFull)) continue
 
           const r = await tryServe(idxFull, idxReq, reqHeaders, encoding, {
-            devMode, initialHeaders, maxAge, directive, useETag, isHead
+            devMode,
+            initialHeaders,
+            maxAge,
+            directive,
+            useETag,
+            isHead,
           })
           if (r) return r
         }
@@ -256,7 +265,12 @@ export async function staticPlugin<const Prefix extends string = '/'>(
 
       // 普通文件
       const r = await tryServe(full, reqPath, reqHeaders, encoding, {
-        devMode, initialHeaders, maxAge, directive, useETag, isHead
+        devMode,
+        initialHeaders,
+        maxAge,
+        directive,
+        useETag,
+        isHead,
       })
       if (r) return r
     }
@@ -280,7 +294,7 @@ export async function staticPlugin<const Prefix extends string = '/'>(
     }: {
       devMode: boolean
       initialHeaders?: Record<string, string>
-      maxAge: number
+      maxAge: number | null
       directive: string
       useETag: boolean
       isHead: boolean
@@ -317,8 +331,8 @@ export async function staticPlugin<const Prefix extends string = '/'>(
 
         ce.body = body
         ce.etag = et
-        ce.mtimeMs = st.mtimeMs
-        ce.size = st.size
+        ce.mtimeMs = st.mtimeMs || 0
+        ce.size = st.size || 0
       }
       return ce
     }
@@ -335,7 +349,7 @@ export async function staticPlugin<const Prefix extends string = '/'>(
           else ce = refreshed
         }
         if (isValid) {
-          return buildResponse(ce, urlPath, initialHeaders, {maxAge, directive}, reqHeaders, enc)
+          return buildResponse(ce!, urlPath, initialHeaders, {maxAge, directive}, reqHeaders, enc)
         }
       }
     }
@@ -354,11 +368,11 @@ export async function staticPlugin<const Prefix extends string = '/'>(
 
         if (isValid) {
           // ETag / 304
-          if (useETag && ce.etag && (await isCached(reqHeaders, ce.etag, fullPath))) {
+          if (useETag && ce!.etag && (await isCached(reqHeaders, ce!.etag, fullPath))) {
             const h = new Headers(initialHeaders ?? {})
             return new Response(null, {status: 304, headers: h})
           }
-          return buildResponse(ce, urlPath, initialHeaders, {maxAge, directive}, reqHeaders)
+          return buildResponse(ce!, urlPath, initialHeaders, {maxAge, directive}, reqHeaders)
         }
       }
     }
@@ -374,8 +388,8 @@ export async function staticPlugin<const Prefix extends string = '/'>(
         body,
         filePath: encFull,
         etag: et,
-        mtimeMs: st?.mtimeMs,
-        size: st?.size ?? 0,
+        mtimeMs: st?.mtimeMs || 0,
+        size: st?.size || 0,
       }
       cache.set(cacheKey(encFull, enc), entry)
       return buildResponse(entry, urlPath, initialHeaders, {maxAge, directive}, reqHeaders, enc)
@@ -408,8 +422,8 @@ export async function staticPlugin<const Prefix extends string = '/'>(
         body,
         filePath: fullPath,
         etag: et,
-        mtimeMs: st?.mtimeMs,
-        size: st?.size ?? 0,
+        mtimeMs: st?.mtimeMs || 0,
+        size: st?.size || 0,
       }
       cache.set(cacheKey(fullPath), entry)
       return buildResponse(entry, urlPath, initialHeaders, {maxAge, directive}, reqHeaders)
@@ -422,7 +436,7 @@ export async function staticPlugin<const Prefix extends string = '/'>(
     entry: CacheEntry,
     urlPath: string,
     initialHeaders: Record<string, string> | undefined,
-    {maxAge, directive}: {maxAge: number; directive: string},
+    {maxAge, directive}: {maxAge: number | null; directive: string},
     reqHeaders: Record<string, string>, // Needed for Range check
     enc?: Encoding
   ) {
